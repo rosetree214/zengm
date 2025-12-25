@@ -337,6 +337,76 @@ def fetch_people(people_ids: list[int], stats_season: int) -> dict[int, dict[str
     return out
 
 
+def playing_time_score(person: dict[str, Any]) -> tuple[float, float, bool]:
+    """
+    Returns (pa, ip, is_pitcher).
+    Used only to pick a projected 26-man roster from offseason 40-man rosters.
+    """
+    primary_pos = ((person.get("primaryPosition") or {}).get("abbreviation")) or "?"
+    hit_stats = pick_stat_split(person, "hitting") or {}
+    pit_stats = pick_stat_split(person, "pitching") or {}
+
+    pa = safe_float(hit_stats.get("plateAppearances"), 0.0)
+    ip = parse_ip(pit_stats.get("inningsPitched")) if pit_stats else 0.0
+    is_pitcher = primary_pos == "P" or ip >= 10.0
+    return pa, ip, is_pitcher
+
+
+def select_projected_active_roster(
+    pids: list[int],
+    people: dict[int, dict[str, Any]],
+    roster_size: int,
+    *,
+    target_pitchers: int = 13,
+) -> list[int]:
+    """
+    ZenGM Baseball does not have a minors/rights system like MLB. If you want a hard 26-man roster
+    in ZenGM, you must only assign 26 players to each team.
+
+    Because 2025-12-25 is the offseason, the real 26-man active rosters for 2026 are not known.
+    So we select a *projected* 26-man roster from the team's 40-man roster using 2025 playing time.
+    """
+    # De-dup while preserving order
+    seen: set[int] = set()
+    uniq: list[int] = []
+    for pid in pids:
+        if pid not in seen:
+            uniq.append(pid)
+            seen.add(pid)
+
+    scored: list[tuple[int, float, float, bool]] = []
+    for pid in uniq:
+        person = people.get(pid)
+        if not person:
+            scored.append((pid, 0.0, 0.0, False))
+            continue
+        pa, ip, is_p = playing_time_score(person)
+        scored.append((pid, pa, ip, is_p))
+
+    pitchers = [(pid, ip) for pid, _pa, ip, is_p in scored if is_p]
+    hitters = [(pid, pa) for pid, pa, _ip, is_p in scored if not is_p]
+
+    pitchers.sort(key=lambda x: x[1], reverse=True)
+    hitters.sort(key=lambda x: x[1], reverse=True)
+
+    want_p = min(target_pitchers, roster_size)
+    want_h = max(0, roster_size - want_p)
+
+    chosen: list[int] = [pid for pid, _ in pitchers[:want_p]] + [pid for pid, _ in hitters[:want_h]]
+
+    # Fill any shortfall from remaining best-by-playing-time regardless of type.
+    if len(chosen) < roster_size:
+        remaining = [x for x in scored if x[0] not in set(chosen)]
+        # combined score: PA + 3*IP (roughly makes 50 IP comparable to 150 PA)
+        remaining.sort(key=lambda x: (x[1] + 3.0 * x[2]), reverse=True)
+        for pid, _pa, _ip, _is_p in remaining:
+            chosen.append(pid)
+            if len(chosen) >= roster_size:
+                break
+
+    return chosen[:roster_size]
+
+
 def build_player(pid: int, person: dict[str, Any], tid: int, season_for_ratings: int) -> dict[str, Any]:
     first = person.get("firstName") or (person.get("useName") or "").strip() or "Player"
     last = person.get("lastName") or (person.get("lastInitName") or "").split(" ", 1)[-1].strip() or "Unknown"
@@ -437,6 +507,7 @@ def main() -> int:
     parser.add_argument("--snapshot-date", default="2025-12-25")
     parser.add_argument("--stats-season", type=int, default=2025)
     parser.add_argument("--starting-season", type=int, default=2026)
+    parser.add_argument("--roster-size", type=int, default=26)
     parser.add_argument("--out", default="/workspace/output/zengm_mlb_2025-12-25.json")
     parser.add_argument("--validate-schema", default="/workspace/output/league-schema.json")
     args = parser.parse_args()
@@ -456,7 +527,8 @@ def main() -> int:
 
     teams = build_teams(args.stats_season)
 
-    # Rosters
+    # Rosters (we use 40-man snapshots as the source of truth for team control in the offseason,
+    # then select a projected "active roster" of args.roster_size players per team).
     team_to_person_ids: dict[int, list[int]] = {}
     all_person_ids: set[int] = set()
     for t in teams_sorted:
@@ -468,15 +540,34 @@ def main() -> int:
 
     people = fetch_people(sorted(all_person_ids), args.stats_season)
 
+    team_active: dict[int, list[int]] = {}
+    team_inactive: dict[int, list[int]] = {}
+    for tid, pids in team_to_person_ids.items():
+        active = select_projected_active_roster(pids, people, args.roster_size)
+        active_set = set(active)
+        inactive = [pid for pid in pids if pid not in active_set]
+        team_active[tid] = active
+        team_inactive[tid] = inactive
+
     players: list[dict[str, Any]] = []
     missing_people: list[int] = []
-    for tid, pids in team_to_person_ids.items():
+    # Active roster players stay on their teams. Inactive 40-man players become free agents,
+    # because ZenGM Baseball does not support MLB-style team control over non-roster players.
+    for tid, pids in team_active.items():
         for pid in pids:
             person = people.get(pid)
             if not person:
                 missing_people.append(pid)
                 continue
             players.append(build_player(pid, person, tid, args.stats_season))
+
+    for tid, pids in team_inactive.items():
+        for pid in pids:
+            person = people.get(pid)
+            if not person:
+                missing_people.append(pid)
+                continue
+            players.append(build_player(pid, person, -1, args.stats_season))
 
     if missing_people:
         print(f"Warning: missing {len(missing_people)} people records", file=sys.stderr)
@@ -489,6 +580,8 @@ def main() -> int:
             "startingSeason": args.starting_season,
             "phase": 0,  # preseason
             "userTid": 0,
+            "minRosterSize": args.roster_size,
+            "maxRosterSize": args.roster_size,
             "confs": [
                 {"cid": 0, "name": "American League"},
                 {"cid": 1, "name": "National League"},
