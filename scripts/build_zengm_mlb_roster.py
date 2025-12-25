@@ -272,7 +272,12 @@ def build_teams(snapshot_season: int) -> list[dict[str, Any]]:
         did = div_map.get(division, 0)
         region = t.get("locationName") or (t.get("name", "").split(" ", 1)[0] if t.get("name") else "Team")
         name = t.get("teamName") or (t.get("name", "").split(" ", 1)[-1] if t.get("name") else f"Team{i}")
+        # MLB Stats API sometimes uses 2-letter abbreviations (AZ/SF/SD). Prefer 3-letter when possible.
         abbrev = t.get("abbreviation") or (t.get("abbrev") or f"T{i:02d}")
+        if isinstance(abbrev, str) and len(abbrev) != 3:
+            team_code = (t.get("teamCode") or "").upper()
+            if len(team_code) == 3:
+                abbrev = team_code
         out.append(
             {
                 "tid": i,
@@ -412,20 +417,6 @@ def build_player(pid: int, person: dict[str, Any], tid: int, season_for_ratings:
     last = person.get("lastName") or (person.get("lastInitName") or "").split(" ", 1)[-1].strip() or "Unknown"
     primary_pos = ((person.get("primaryPosition") or {}).get("abbreviation")) or "?"
 
-    birth_date = person.get("birthDate")
-    born_year = None
-    if birth_date:
-        try:
-            born_year = datetime.strptime(birth_date, "%Y-%m-%d").date().year
-        except Exception:
-            born_year = None
-
-    birth_city = (person.get("birthCity") or "").strip()
-    birth_state = (person.get("birthStateProvince") or "").strip()
-    birth_country = (person.get("birthCountry") or "").strip()
-    born_loc_parts = [p for p in [birth_city, birth_state, birth_country] if p]
-    born_loc = ", ".join(born_loc_parts)
-
     height_in = inches_from_height_str(person.get("height"))
     # Map typical MLB range (5'5"=65 to 6'7"=79) into ~30..70.
     hgt_rating = 50
@@ -485,19 +476,13 @@ def build_player(pid: int, person: dict[str, Any], tid: int, season_for_ratings:
         # Leave ovr/pot/pos/skills out; ZenGM will compute them on import (per docs).
     }
 
+    # Keep player objects minimal to maximize import compatibility.
     out: dict[str, Any] = {
         "firstName": first,
         "lastName": last,
         "tid": tid,
         "ratings": [ratings_obj],
     }
-
-    # Optional: include born if we have it. Schema requires loc if present.
-    if born_year is not None and born_loc:
-        out["born"] = {"year": born_year, "loc": born_loc}
-
-    # Helpful extra metadata (allowed by schema): "pos" at root is a string.
-    out["pos"] = primary_pos
 
     return out
 
